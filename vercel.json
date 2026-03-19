@@ -1,0 +1,7 @@
+{
+  "name": "pickleball-booking",
+  "version": "3.0.0",
+  "description": "Booking app - Supabase + Resend, no GAS",
+  "engines": { "node": "22.x" },
+  "dependencies": {}
+}

@@ -1,0 +1,440 @@
+/**
+ * Supabase helper — dùng https module thuần (Node.js built-in)
+ * Không phụ thuộc fetch hay node-fetch
+ * ⚡ SUPABASE ONLY — không còn GAS fallback
+ */
+const https  = require('https');
+const crypto = require('crypto');
+
+const SB_URL = process.env.SUPABASE_URL || 'https://ehxykjfbkqolkxcahbzk.supabase.co';
+const SB_KEY = process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImVoeHlramZia3FvbGt4Y2FoYnprIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM4OTI3OTIsImV4cCI6MjA4OTQ2ODc5Mn0.OphFvyvG500OVoXwCiY4y_7pbt24FUINGnQe7OJDM1U';
+
+/**
+ * Generic Supabase REST request
+ */
+function sbReq(path, method, body, extraHeaders) {
+  return new Promise((resolve, reject) => {
+    if (!SB_URL || !SB_KEY) return reject(new Error('Supabase env vars chưa được cấu hình'));
+    const bodyStr = body ? JSON.stringify(body) : null;
+    const urlObj  = new URL(SB_URL + '/rest/v1/' + path);
+    const headers = {
+      'apikey':        SB_KEY,
+      'Authorization': 'Bearer ' + SB_KEY,
+      'Content-Type':  'application/json',
+      'Prefer':        'return=representation',
+    };
+    if (extraHeaders) Object.assign(headers, extraHeaders);
+    if (bodyStr) headers['Content-Length'] = Buffer.byteLength(bodyStr);
+
+    const opts = {
+      hostname: urlObj.hostname,
+      path:     urlObj.pathname + urlObj.search,
+      method:   method || 'GET',
+      headers,
+    };
+
+    const req = https.request(opts, (res) => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode >= 400) {
+          return reject(new Error('SB ' + method + ' ' + path + ' → ' + res.statusCode + ': ' + data.slice(0,200)));
+        }
+        try { resolve(data ? JSON.parse(data) : null); }
+        catch(e) { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    if (bodyStr) req.write(bodyStr);
+    req.end();
+  });
+}
+
+// ════════════════════════════════════════════
+// BOOKINGS
+// ════════════════════════════════════════════
+
+async function sbReadBookings(date) {
+  const filter = date ? 'date=eq.' + encodeURIComponent(date) + '&' : '';
+  const rows = await sbReq('bookings?' + filter + 'order=created_at.desc');
+  return (rows || []).map(normalizeBookingRow);
+}
+
+async function sbWriteBooking(p) {
+  const row = {
+    customer_name: String(p.name        || ''),
+    phone:         String(p.phone       || ''),
+    court:         String(p.court       || ''),
+    date:          p.date               || null,
+    start_time:    String(p.startHour   || ''),
+    hours:         Number(p.duration)   || 1,
+    price:         Number(p.total)      || 0,
+    status:        p.status             || 'pending',
+    member_id:     p.memberId           || null,
+    note:          String(p.note        || ''),
+    payment:       String(p.payment     || 'cash'),
+    players:       Number(p.players)    || 0,
+    rackets:       Number(p.rackets)    || 0,
+    court_total:   Number(p.courtTotal) || 0,
+    racket_total:  Number(p.racketTotal)|| 0,
+  };
+  return sbReq('bookings', 'POST', row);
+}
+
+async function sbUpdateBookingStatus(id, status, payment) {
+  const fields = { status };
+  if (payment) fields.payment = payment;
+  return sbReq('bookings?id=eq.' + encodeURIComponent(id), 'PATCH', fields);
+}
+
+async function sbGetSlotsForDate(date, court) {
+  let q = 'bookings?date=eq.' + encodeURIComponent(date) + '&status=neq.cancelled';
+  if (court) q += '&court=eq.' + encodeURIComponent(court);
+  q += '&select=start_time,hours,court';
+  return sbReq(q) || [];
+}
+
+function normalizeBookingRow(r) {
+  return {
+    id:          r.id          || '',
+    name:        r.customer_name || '',
+    phone:       r.phone       || '',
+    date:        r.date        || '',
+    court:       r.court       || '',
+    startHour:   r.start_time  || '',
+    duration:    Number(r.hours)        || 1,
+    players:     Number(r.players)      || 0,
+    rackets:     Number(r.rackets)      || 0,
+    courtTotal:  Number(r.court_total)  || 0,
+    racketTotal: Number(r.racket_total) || 0,
+    total:       Number(r.price)        || 0,
+    status:      r.status      || 'pending',
+    payment:     r.payment     || '',
+    note:        r.note        || '',
+    memberId:    r.member_id   || '',
+    createdAt:   r.created_at  || '',
+  };
+}
+
+// ════════════════════════════════════════════
+// MEMBERS
+// ════════════════════════════════════════════
+
+/** Tính tier dựa trên tổng chi tiêu */
+function calcTier(totalSpent) {
+  const s = Number(totalSpent) || 0;
+  if (s >= 20000000) return 'gold';
+  if (s >= 5000000)  return 'silver';
+  return 'bronze';
+}
+
+/** Discount % theo tier */
+function tierDiscount(tier) {
+  const map = { gold: 10, silver: 7, bronze: 5, black: 5 };
+  return map[tier] || 0;
+}
+
+/** Hash password với crypto.scrypt */
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
+  return salt + ':' + hash;
+}
+
+/** Verify password */
+function verifyPassword(password, stored) {
+  try {
+    const [salt, hash] = stored.split(':');
+    const hashVerify = crypto.scryptSync(String(password), salt, 64).toString('hex');
+    return hash === hashVerify;
+  } catch { return false; }
+}
+
+async function sbGetMember(phone) {
+  const rows = await sbReq('members?phone=eq.' + encodeURIComponent(phone));
+  return (rows && rows.length) ? rows[0] : null;
+}
+
+async function sbGetMemberByEmail(email) {
+  const rows = await sbReq('members?email=eq.' + encodeURIComponent(email.toLowerCase().trim()));
+  return (rows && rows.length) ? rows[0] : null;
+}
+
+async function sbGetMemberById(id) {
+  const rows = await sbReq('members?id=eq.' + encodeURIComponent(id));
+  return (rows && rows.length) ? rows[0] : null;
+}
+
+/** Đăng ký thành viên mới */
+async function sbRegisterMember(data) {
+  if (!data.email || !data.password) throw new Error('Thiếu email hoặc mật khẩu');
+  // Kiểm tra trùng email
+  const existing = await sbGetMemberByEmail(data.email);
+  if (existing) throw new Error('Email đã được đăng ký');
+  // Kiểm tra trùng phone
+  if (data.phone) {
+    const byPhone = await sbGetMember(data.phone);
+    if (byPhone) throw new Error('Số điện thoại đã được đăng ký');
+  }
+  const row = {
+    name:          String(data.name  || ''),
+    phone:         String(data.phone || ''),
+    email:         data.email.toLowerCase().trim(),
+    password_hash: hashPassword(data.password),
+    tier:          'bronze',
+    total_spent:   0,
+    monthly_spent: 0,
+    points:        0,
+    active:        true,
+  };
+  const result = await sbReq('members', 'POST', row);
+  return normalizeMember(Array.isArray(result) ? result[0] : result);
+}
+
+/** Đăng nhập thành viên */
+async function sbLoginMember(email, password) {
+  const member = await sbGetMemberByEmail(email);
+  if (!member) throw new Error('Email chưa được đăng ký');
+  if (!member.active) throw new Error('Tài khoản đã bị khóa');
+  if (!member.password_hash) throw new Error('Tài khoản chưa đặt mật khẩu — dùng OTP để đặt lại');
+  if (!verifyPassword(password, member.password_hash)) throw new Error('Mật khẩu không đúng');
+  return normalizeMember(member);
+}
+
+/** Cập nhật mật khẩu (sau khi verify OTP reset) */
+async function sbUpdateMemberPassword(email, newPassword) {
+  const hash = hashPassword(newPassword);
+  await sbReq('members?email=eq.' + encodeURIComponent(email.toLowerCase()), 'PATCH', { password_hash: hash });
+}
+
+/** Cộng điểm cho thành viên */
+async function sbAddPoints(memberId, points) {
+  const member = await sbGetMemberById(memberId);
+  if (!member) throw new Error('Không tìm thấy thành viên');
+  const newPoints = (Number(member.points) || 0) + Number(points);
+  await sbReq('members?id=eq.' + encodeURIComponent(memberId), 'PATCH', { points: newPoints });
+  return { points: newPoints };
+}
+
+/** Cập nhật chi tiêu thành viên và tier */
+async function sbUpdateMemberSpending(memberId, amount) {
+  // Lấy thông tin hiện tại
+  const member = await sbGetMemberById(memberId);
+  if (!member) return null;
+  const newTotal    = (Number(member.total_spent)   || 0) + Number(amount);
+  const newMonthly  = (Number(member.monthly_spent) || 0) + Number(amount);
+  const newPoints   = (Number(member.points)        || 0) + Math.floor(Number(amount) / 10000);
+  const newTier     = calcTier(newTotal);
+  await sbReq('members?id=eq.' + encodeURIComponent(memberId), 'PATCH', {
+    total_spent:   newTotal,
+    monthly_spent: newMonthly,
+    points:        newPoints,
+    tier:          newTier,
+  });
+  return { totalSpent: newTotal, monthlySpent: newMonthly, points: newPoints, tier: newTier };
+}
+
+/** Đặt lại monthly_spent (cuối tháng) */
+async function sbResetMonthlySpent() {
+  return sbReq('members?active=eq.true', 'PATCH', { monthly_spent: 0 });
+}
+
+function normalizeMember(m) {
+  if (!m) return null;
+  return {
+    id:           m.id           || '',
+    name:         m.name         || '',
+    phone:        m.phone        || '',
+    email:        m.email        || '',
+    tier:         m.tier         || 'bronze',
+    totalSpent:   Number(m.total_spent)   || 0,
+    monthlySpent: Number(m.monthly_spent) || 0,
+    points:       Number(m.points)        || 0,
+    active:       m.active !== false,
+    discount:     tierDiscount(m.tier || 'bronze'),
+    createdAt:    m.created_at   || '',
+  };
+}
+
+// ════════════════════════════════════════════
+// MEMBER OTP (lưu trong Supabase, dùng chung cho member login/reset)
+// ════════════════════════════════════════════
+
+function genOtp6() {
+  return String(Math.floor(100000 + Math.random() * 900000));
+}
+
+/** Tạo OTP mới cho member (type: login | reset) */
+async function sbCreateMemberOtp(email, type) {
+  // Xóa OTP cũ chưa dùng của email này
+  await sbReq(
+    'member_otps?email=eq.' + encodeURIComponent(email) + '&type=eq.' + type + '&used=eq.false',
+    'DELETE', null
+  ).catch(() => {});
+
+  const otp = genOtp6();
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  await sbReq('member_otps', 'POST', { email, otp, type, expires_at: expiresAt, used: false });
+  return otp;
+}
+
+/** Xác minh OTP của member */
+async function sbVerifyMemberOtp(email, otp, type) {
+  const rows = await sbReq(
+    'member_otps?email=eq.' + encodeURIComponent(email) +
+    '&otp=eq.' + encodeURIComponent(otp) +
+    '&type=eq.' + type +
+    '&used=eq.false'
+  );
+  if (!rows || !rows.length) return false;
+  const record = rows[0];
+  if (new Date(record.expires_at) < new Date()) return false;
+  // Đánh dấu đã dùng
+  await sbReq('member_otps?id=eq.' + record.id, 'PATCH', { used: true }).catch(() => {});
+  return true;
+}
+
+// ════════════════════════════════════════════
+// ADMINS (thay thế ADMIN_EMAILS env var + GAS Admins sheet)
+// ════════════════════════════════════════════
+
+async function sbGetAdmin(email) {
+  const rows = await sbReq('admins?email=eq.' + encodeURIComponent(email.toLowerCase().trim()) + '&active=eq.true');
+  return (rows && rows.length) ? rows[0] : null;
+}
+
+async function sbListAdmins() {
+  const rows = await sbReq('admins?active=eq.true&order=created_at.asc');
+  return rows || [];
+}
+
+// ════════════════════════════════════════════
+// FNB MENU
+// ════════════════════════════════════════════
+
+async function sbReadFnbMenu(customerOnly) {
+  const filter = customerOnly ? 'available=eq.true&' : '';
+  const rows = await sbReq('fnb_menu?' + filter + 'order=category.asc,name.asc');
+  return (rows || []).map(r => ({
+    id:     r.id,
+    name:   r.name,
+    price:  Number(r.price) || 0,
+    cat:    r.category || 'other',
+    icon:   '📦',
+    img:    r.image_url || '',
+    active: r.available !== false,
+  }));
+}
+
+async function sbSaveFnbItem(item) {
+  const row = {
+    name:      String(item.name     || ''),
+    price:     Number(item.price)   || 0,
+    category:  String(item.cat || item.category || 'other'),
+    image_url: String(item.img || item.image_url || ''),
+    available: (item.active !== false && item.active !== 'false'),
+  };
+  if (item.id) {
+    return sbReq('fnb_menu?id=eq.' + item.id, 'PATCH', row);
+  }
+  return sbReq('fnb_menu', 'POST', row);
+}
+
+async function sbDeleteFnbItem(id) {
+  return sbReq('fnb_menu?id=eq.' + encodeURIComponent(id), 'DELETE');
+}
+
+// ════════════════════════════════════════════
+// FNB ORDERS
+// ════════════════════════════════════════════
+
+async function sbReadFnbOrders(date) {
+  const today = date || new Date().toISOString().split('T')[0];
+  const from = today + 'T00:00:00+07:00';
+  const to   = today + 'T23:59:59+07:00';
+  const rows = await sbReq(
+    'fnb_orders?created_at=gte.' + encodeURIComponent(from) +
+    '&created_at=lte.' + encodeURIComponent(to) +
+    '&order=created_at.desc'
+  );
+  return (rows || []).map(r => ({
+    id:        r.id,
+    bookingId: r.booking_id || '',
+    court:     r.court      || '',
+    items:     typeof r.items === 'string' ? JSON.parse(r.items) : (r.items || []),
+    total:     Number(r.total) || 0,
+    status:    r.status    || 'pending',
+    note:      r.note      || '',
+    createdAt: r.created_at || '',
+  }));
+}
+
+async function sbSubmitFnbOrder(data) {
+  let items = data.items;
+  if (typeof items === 'string') { try { items = JSON.parse(items); } catch(_) {} }
+  return sbReq('fnb_orders', 'POST', {
+    booking_id: data.bookingId || null,
+    items:      items          || [],
+    total:      Number(data.total) || 0,
+    status:     'pending',
+    court:      String(data.court || ''),
+    note:       String(data.note  || ''),
+  });
+}
+
+async function sbUpdateFnbOrderStatus(id, status) {
+  return sbReq('fnb_orders?id=eq.' + encodeURIComponent(id), 'PATCH', { status });
+}
+
+// ════════════════════════════════════════════
+// CONFIG
+// ════════════════════════════════════════════
+
+async function sbReadConfig() {
+  const rows = await sbReq('config');
+  const cfg = {};
+  (rows || []).forEach(r => { cfg[r.key] = r.value; });
+  return cfg;
+}
+
+async function sbWriteConfigKey(key, value) {
+  return sbReq('config', 'POST', { key, value: String(value) }, {
+    'Prefer': 'resolution=merge-duplicates,return=representation',
+  });
+}
+
+module.exports = {
+  // Bookings
+  sbReadBookings,
+  sbWriteBooking,
+  sbUpdateBookingStatus,
+  sbGetSlotsForDate,
+  // Members
+  sbGetMember,
+  sbGetMemberByEmail,
+  sbGetMemberById,
+  sbRegisterMember,
+  sbLoginMember,
+  sbUpdateMemberPassword,
+  sbUpdateMemberSpending,
+  sbAddPoints,
+  sbResetMonthlySpent,
+  normalizeMember,
+  // Member OTP
+  sbCreateMemberOtp,
+  sbVerifyMemberOtp,
+  // Admins
+  sbGetAdmin,
+  sbListAdmins,
+  // FNB Menu
+  sbReadFnbMenu,
+  sbSaveFnbItem,
+  sbDeleteFnbItem,
+  // FNB Orders
+  sbReadFnbOrders,
+  sbSubmitFnbOrder,
+  sbUpdateFnbOrderStatus,
+  // Config
+  sbReadConfig,
+  sbWriteConfigKey,
+};
